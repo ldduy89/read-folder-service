@@ -10,6 +10,7 @@ const { SubtitleParser, SubtitleStream } = require("matroska-subtitles");
 const { stringifySync } = require("subtitle");
 const strstream = require("string-to-stream");
 var ass2srt = require("ass-to-srt");
+const assLib = require("./ass");
 const mime = require("mime-types");
 const { spawn, execFile } = require("child_process");
 
@@ -305,6 +306,11 @@ app.get("/read/*", function (req, res) {
   return res.send(datas);
 });
 
+const sendVtt = (res, vtt) => {
+  res.set("Content-Type", "text/vtt; charset=utf-8");
+  res.send(vtt);
+};
+
 app.get("/subtitles/*", function (req, res) {
   const fullPath = req.params[0].split("/").filter((p) => !!p);
   let pathFile = req.params[0].replace(new RegExp(fileTypes.join("|"), "g"), ".json");
@@ -314,6 +320,14 @@ app.get("/subtitles/*", function (req, res) {
     const path = getSubtitlesOutside(fullPath);
     if (path) {
       if (path.includes(".ass")) {
+        // Đọc ASS trực tiếp (giữ \pos, \an, \fs, màu... và style) thay vì ass-to-srt
+        try {
+          const parsed = assLib.parseAss(assLib.decodeText(fs.readFileSync(path)));
+          sendVtt(res, assLib.eventsToVtt(parsed.events));
+          return;
+        } catch (error) {
+          console.log("ass parse error", error);
+        }
         const str = fs.readFileSync(path);
         strstream(ass2srt(str)).pipe(srt2vtt()).pipe(res);
       } else {
@@ -326,12 +340,49 @@ app.get("/subtitles/*", function (req, res) {
     const data = fs.readFileSync(`subtitles/${pathFile}`, "utf8");
     if (data) {
       const info = JSON.parse(data || "{}");
-      str = stringifySync(info[language] || [], { format: "SRT" });
+      const cues = info[language] || [];
+      const isAss = (info._ass && info._ass[language]) || cues.some((c) => assLib.looksLikeAss(c.data && c.data.text));
+      if (isAss) {
+        // Track ASS (hoặc text có thẻ ASS): giữ nguyên thẻ + thông tin style cho client tự vẽ
+        const events = cues.map((c) => ({
+          start: c.data.start / 1000,
+          end: c.data.end / 1000,
+          text: c.data.text,
+          style: c.data.style,
+          layer: c.data.layer,
+          marginL: c.data.marginL,
+          marginR: c.data.marginR,
+          marginV: c.data.marginV
+        }));
+        sendVtt(res, assLib.eventsToVtt(events));
+        return;
+      }
+      str = stringifySync(cues, { format: "SRT" });
       strstream(str).pipe(srt2vtt()).pipe(res);
       return;
     }
   } catch (error) {}
   strstream("").pipe(srt2vtt()).pipe(res);
+});
+
+// Header của sub ASS: PlayResX/PlayResY + bảng style (client dùng để vẽ đúng cỡ chữ, màu, vị trí)
+app.get("/subtitles-style/*", function (req, res) {
+  const fullPath = req.params[0].split("/").filter((p) => !!p);
+  const language = req.query.language;
+  try {
+    if (language === "default_sv") {
+      const subFile = getSubtitlesOutside(fullPath);
+      if (subFile && subFile.includes(".ass")) {
+        return res.json(assLib.parseAssHeader(assLib.decodeText(fs.readFileSync(subFile))));
+      }
+      return res.json({});
+    }
+    const pathFile = req.params[0].replace(new RegExp(fileTypes.join("|"), "g"), ".json");
+    const info = JSON.parse(fs.readFileSync(`subtitles/${pathFile}`, "utf8") || "{}");
+    return res.json((info._ass && info._ass[language]) || {});
+  } catch (error) {
+    return res.json({});
+  }
 });
 
 const server = app.listen(8081, function () {
@@ -444,7 +495,16 @@ const convert = (path, fulltracks) => {
 const parter = (newTracks, path, pathFile, pathRoot, fullPath, resolve, reject) => {
   const parser = new SubtitleParser();
   const subtitleObj = {};
+  const assMeta = {}; // language -> { playResX, playResY, styles } cho track ASS
   let index = 1;
+  parser.once("tracks", (tracks) => {
+    (tracks || []).forEach((t) => {
+      const lang = (newTracks.find((n) => n.number == t.number) || {}).language;
+      if (lang && t.header && /\[(V4\+? Styles|Script Info)\]/i.test(String(t.header))) {
+        assMeta[lang] = assLib.parseAssHeader(t.header);
+      }
+    });
+  });
   parser.on("subtitle", (subtitle, trackNumber) => {
     if (index % 200 === 0) {
       console.log(pathFile, ": ", index);
@@ -456,6 +516,17 @@ const parter = (newTracks, path, pathFile, pathRoot, fullPath, resolve, reject) 
         type: "cue",
         data: { start: subtitle.time, end: subtitle.time + subtitle.duration, text: subtitle.text }
       };
+      if (subtitle.style !== undefined) {
+        // Track ASS: lưu thêm style / layer / margin riêng của từng dòng
+        Object.assign(rowRob.data, {
+          style: subtitle.style,
+          layer: subtitle.layer,
+          marginL: subtitle.marginL,
+          marginR: subtitle.marginR,
+          marginV: subtitle.marginV
+        });
+        if (!assMeta[language]) assMeta[language] = { playResX: 0, playResY: 0, styles: {} };
+      }
       if (subtitleObj[language]) {
         subtitleObj[language].push(rowRob);
       } else {
@@ -464,6 +535,7 @@ const parter = (newTracks, path, pathFile, pathRoot, fullPath, resolve, reject) 
     }
   });
   parser.on("finish", () => {
+    if (!_.isEmpty(assMeta)) subtitleObj._ass = assMeta;
     fsExtra.outputFile(`subtitles/${pathFile}`, JSON.stringify(subtitleObj));
     console.log(path, ": finish");
     resolve("finish");
