@@ -13,6 +13,8 @@
     "cors": "^2.8.5",
     "dev-null": "^0.1.1",
     "express": "^4.18.1",
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0",
     "fs": "0.0.1-security",
     "fs-extra": "^10.1.0",
     "lodash": "^4.17.21",

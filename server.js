@@ -11,6 +11,18 @@ const { stringifySync } = require("subtitle");
 const strstream = require("string-to-stream");
 var ass2srt = require("ass-to-srt");
 const mime = require("mime-types");
+const { spawn, execFile } = require("child_process");
+
+// ffmpeg / ffprobe: ưu tiên bản đóng gói sẵn trong npm (ffmpeg-static, ffprobe-static),
+// nếu chưa cài thì dùng ffmpeg/ffprobe có trong PATH của máy.
+let ffmpegPath = "ffmpeg";
+let ffprobePath = "ffprobe";
+try {
+  ffmpegPath = require("ffmpeg-static") || "ffmpeg";
+} catch (e) {}
+try {
+  ffprobePath = require("ffprobe-static").path || "ffprobe";
+} catch (e) {}
 
 const folderPuclic = [
   {
@@ -23,8 +35,8 @@ const folderPuclic = [
   },
   {
     name: "Download",
-    path: "C:/Users/Duy/Downloads"
-    // path: "/Users/macbookpro/Downloads"
+    // path: "C:/Users/Duy/Downloads"
+    path: "/Users/ngoctrammai/Downloads/"
   }
 ];
 
@@ -83,7 +95,10 @@ app.get("/public/*", function (req, res) {
     convertSubtitle(paths);
     res.send(list);
     return;
-  } catch (error) {}
+  } catch (error) {
+    console.log(error);
+    
+  }
   res.send("listName");
 });
 
@@ -136,6 +151,150 @@ app.get("/trasks/*", function (req, res) {
     console.log(" error", error);
     res.send(fulltracks);
   }
+});
+
+
+// ================= AUDIO (nhiều audio trong 1 file) =================
+const audioDir = path.join(__dirname, "audios");
+const audioJobs = new Map(); // outPath -> { error: boolean }
+
+const resolveMediaFile = (p) => {
+  const fullPath = (p || "").split("/").filter((x) => !!x);
+  if (fullPath.length < 2 || fullPath.includes("..")) return null;
+  const folder = folderPuclic.find((f) => f.name === _.first(fullPath));
+  if (!folder) return null;
+  return { fullPath, file: [folder.path, ..._.drop(fullPath)].join("/") };
+};
+
+const channelLayout = (n) => ({ 1: "1.0", 2: "2.0", 6: "5.1", 8: "7.1" }[n] || (n ? `${n}ch` : ""));
+
+const languageName = (code) => {
+  if (!code || code === "und") return "";
+  try {
+    return new Intl.DisplayNames(["vi"], { type: "language" }).of(code) || code;
+  } catch (e) {
+    return code;
+  }
+};
+
+const buildAudioLabel = (stream, index) => {
+  const tags = stream.tags || {};
+  const lang = languageName(tags.language);
+  let name = tags.title || lang || `Audio ${index + 1}`;
+  if (tags.title && lang && !tags.title.toLowerCase().includes(lang.toLowerCase())) name = `${tags.title} (${lang})`;
+  const tech = [(stream.codec_name || "").toUpperCase(), channelLayout(stream.channels)].filter(Boolean).join(" ");
+  return tech ? `${name} - ${tech}` : name;
+};
+
+const probeAudio = (file) =>
+  new Promise((resolve, reject) => {
+    execFile(
+      ffprobePath,
+      [
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index,codec_name,channels:stream_disposition=default:stream_tags=language,title",
+        "-of",
+        "json",
+        file
+      ],
+      { maxBuffer: 10 * 1024 * 1024 },
+      (error, stdout) => {
+        if (error) return reject(error);
+        let streams = [];
+        try {
+          streams = JSON.parse(stdout).streams || [];
+        } catch (e) {}
+        let defaultIndex = streams.findIndex((st) => st.disposition && st.disposition.default === 1);
+        if (defaultIndex < 0) defaultIndex = 0;
+        resolve(
+          streams.map((st, i) => ({
+            index: i,
+            codec: st.codec_name,
+            channels: st.channels,
+            language: (st.tags || {}).language,
+            label: buildAudioLabel(st, i),
+            default: i === defaultIndex
+          }))
+        );
+      }
+    );
+  });
+
+const audioCachePath = (fullPath, track) => path.join(audioDir, ..._.dropRight(fullPath), `${_.last(fullPath)}.a${track}.m4a`);
+
+// Tách 1 audio track ra file .m4a riêng (có cache) để trình duyệt phát song song với video
+const startAudioExtract = async (file, track, out) => {
+  const job = { error: false };
+  audioJobs.set(out, job);
+  const tmp = out + ".part";
+  try {
+    const list = await probeAudio(file);
+    const info = list[track];
+    if (!info) throw new Error("Khong co audio track " + track);
+    fsExtra.ensureDirSync(path.dirname(out));
+    const codecArgs = info.codec === "aac" ? ["-c:a", "copy"] : ["-c:a", "aac", "-b:a", info.channels > 2 ? "384k" : "192k"];
+    const args = ["-y", "-v", "error", "-i", file, "-map", `0:a:${track}`, "-vn", "-sn", "-dn", ...codecArgs, "-movflags", "+faststart", "-f", "mp4", tmp];
+    console.log("audio extract:", file, "track", track, info.codec);
+    await new Promise((resolve, reject) => {
+      const proc = spawn(ffmpegPath, args);
+      let err = "";
+      proc.stderr.on("data", (d) => (err += d.toString()));
+      proc.on("error", reject);
+      proc.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err || `ffmpeg exit ${code}`))));
+    });
+    fsExtra.moveSync(tmp, out, { overwrite: true });
+    audioJobs.delete(out);
+    console.log("audio extract: finish", out);
+  } catch (error) {
+    console.log("audio extract error:", error.message);
+    try {
+      fsExtra.removeSync(tmp);
+    } catch (e) {}
+    job.error = true; // báo lỗi 1 lần ở lần hỏi tiếp theo
+  }
+};
+
+// Danh sách audio của file
+app.get("/audios/*", async (req, res) => {
+  const m = resolveMediaFile(req.params[0]);
+  if (!m || !fs.existsSync(m.file)) return res.send([]);
+  try {
+    res.send(await probeAudio(m.file));
+  } catch (error) {
+    console.log("probe error:", error.message);
+    res.send([]);
+  }
+});
+
+// Chuẩn bị audio track được chọn: { ready: true } | { waiting: true } | { error: true }
+app.get("/audio-prepare/*", (req, res) => {
+  const track = parseInt(req.query.track, 10);
+  const m = resolveMediaFile(req.params[0]);
+  if (!m || isNaN(track) || track < 0 || !fs.existsSync(m.file)) return res.status(400).send({ error: true });
+  const out = audioCachePath(m.fullPath, track);
+  if (fs.existsSync(out)) return res.send({ ready: true });
+  const job = audioJobs.get(out);
+  if (job && job.error) {
+    audioJobs.delete(out);
+    return res.send({ error: true });
+  }
+  if (!job) startAudioExtract(m.file, track, out);
+  res.send({ waiting: true });
+});
+
+// File audio đã tách (hỗ trợ Range để tua)
+app.get("/audio-file/*", (req, res) => {
+  const track = parseInt(req.query.track, 10);
+  const m = resolveMediaFile(req.params[0]);
+  if (!m || isNaN(track) || track < 0) return res.sendStatus(400);
+  const out = audioCachePath(m.fullPath, track);
+  if (!fs.existsSync(out)) return res.sendStatus(404);
+  res.type("audio/mp4");
+  res.sendFile(out, { dotfiles: "allow" });
 });
 
 app.get("/read/*", function (req, res) {
