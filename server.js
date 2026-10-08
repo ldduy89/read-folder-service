@@ -115,8 +115,9 @@ app.get("/trasks/*", function (req, res) {
     const stream = new SubtitleStream();
     let isTracks = false;
 
-    const pathSub = getSubtitlesOutside(fullPath);
-    if (pathSub) fulltracks.push({ language: "default_sv", lable: "default", type: "utf8", default: true });
+    listSubtitlesOutside(fullPath).forEach((r, i) => {
+      fulltracks.push({ language: r.language, lable: r.lable, type: "utf8", default: i === 0 });
+    });
     stream.once("tracks", (tracks) => {
       isTracks = true;
       for (let index = 0; index < tracks.length; index++) {
@@ -316,10 +317,10 @@ app.get("/subtitles/*", function (req, res) {
   let pathFile = req.params[0].replace(new RegExp(fileTypes.join("|"), "g"), ".json");
   const language = req.query.language;
   let str = "";
-  if (language === "default_sv") {
-    const path = getSubtitlesOutside(fullPath);
+  if (isOutsideLang(language)) {
+    const path = getSubtitlesOutside(fullPath, language);
     if (path) {
-      if (path.includes(".ass")) {
+      if (/\.ass$/i.test(path)) {
         // Đọc ASS trực tiếp (giữ \pos, \an, \fs, màu... và style) thay vì ass-to-srt
         try {
           const parsed = assLib.parseAss(assLib.decodeText(fs.readFileSync(path)));
@@ -370,9 +371,9 @@ app.get("/subtitles-style/*", function (req, res) {
   const fullPath = req.params[0].split("/").filter((p) => !!p);
   const language = req.query.language;
   try {
-    if (language === "default_sv") {
-      const subFile = getSubtitlesOutside(fullPath);
-      if (subFile && subFile.includes(".ass")) {
+    if (isOutsideLang(language)) {
+      const subFile = getSubtitlesOutside(fullPath, language);
+      if (subFile && /\.ass$/i.test(subFile)) {
         return res.json(assLib.parseAssHeader(assLib.decodeText(fs.readFileSync(subFile))));
       }
       return res.json({});
@@ -391,22 +392,40 @@ const server = app.listen(8081, function () {
   console.log("Ung dung Node.js dang lang nghe tai dia chi: http://%s:%s", host, port);
 });
 
-const getSubtitlesOutside = (fullPath) => {
+// Sub nằm ngoài, cùng thư mục với video. Với video "video.mp4" nhận:
+//   video.ass | video.srt | video.vtt          -> track "default"
+//   video_vi.vtt | video-vi.srt | video_en.ass  -> mỗi file một track, tên track = phần sau dấu _ hoặc -
+const SUB_FILE = /\.(ass|srt|vtt)$/i;
+const outsideLang = (suffix) => "ext_" + suffix.replace(/[&#?%+=\s]/g, "_"); // id track, an toàn khi nằm trong query string
+const isOutsideLang = (language) => language === "default_sv" || (typeof language === "string" && language.startsWith("ext_"));
+
+const listSubtitlesOutside = (fullPath) => {
   const root = _.first(fullPath) || "";
   const pathRoot = folderPuclic.find((f) => f.name === root).path;
   const folder = [pathRoot, ..._.drop(_.dropRight(fullPath))].join("/");
-  const file = _.last(fullPath);
-  const nameass = file.replace(new RegExp(fileTypes.join("|"), "g"), ".ass");
-  const namesrc = file.replace(new RegExp(fileTypes.join("|"), "g"), ".srt");
-  const namevtt = file.replace(new RegExp(fileTypes.join("|"), "g"), ".vtt");
-  const files = fs.readdirSync(folder);
-  let path;
-  files.forEach((f) => {
-    if ([nameass, namesrc, namevtt].includes(f) && !path) {
-      path = [folder, f.trim()].filter((p) => !!p).join("/");
-    }
-  });
-  return path;
+  const base = _.last(fullPath).replace(/\.[^.]+$/, "");
+  const result = [];
+  fs.readdirSync(folder)
+    .sort()
+    .forEach((f) => {
+      if (!SUB_FILE.test(f)) return;
+      const stem = f.replace(SUB_FILE, "").trim();
+      const file = [folder, f.trim()].filter((p) => !!p).join("/");
+      if (stem === base.trim()) {
+        if (!result.find((r) => r.language === "default_sv")) result.unshift({ language: "default_sv", lable: "default", path: file });
+      } else if (stem.startsWith(base + "_") || stem.startsWith(base + "-")) {
+        const suffix = stem.slice(base.length + 1).trim();
+        if (suffix) result.push({ language: outsideLang(suffix), lable: suffix, path: file });
+      }
+    });
+  return result;
+};
+
+// language = "default_sv" (file cùng tên) hoặc "ext_<hậu tố>"; không truyền thì lấy track đầu tiên
+const getSubtitlesOutside = (fullPath, language) => {
+  const list = listSubtitlesOutside(fullPath);
+  const found = language ? list.find((r) => r.language === language) : list[0];
+  return found ? found.path : undefined;
 };
 
 const cleanSubs = async (fileNames, fullPath) => {
