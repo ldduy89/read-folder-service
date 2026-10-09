@@ -503,6 +503,8 @@ app.get("/subtitles-style/*", function (req, res) {
   }
 });
 
+require("./translate")(app); // /translate, /tts (dịch + giọng đọc)
+
 const server = app.listen(8081, function () {
   const host = server.address().address;
   const port = server.address().port;
