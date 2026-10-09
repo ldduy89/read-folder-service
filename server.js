@@ -13,6 +13,7 @@ var ass2srt = require("ass-to-srt");
 const assLib = require("./ass");
 const mime = require("mime-types");
 const { spawn, execFile } = require("child_process");
+const os = require("os");
 
 // ffmpeg / ffprobe: ưu tiên bản đóng gói sẵn trong npm (ffmpeg-static, ffprobe-static),
 // nếu chưa cài thì dùng ffmpeg/ffprobe có trong PATH của máy.
@@ -25,21 +26,70 @@ try {
   ffprobePath = require("ffprobe-static").path || "ffprobe";
 } catch (e) {}
 
-const folderPuclic = [
-  {
-    name: "Disk_E",
-    path: "E:"
-  },
-  {
-    name: "Disk_F",
-    path: "F:"
-  },
-  {
-    name: "Download",
-    // path: "C:/Users/Duy/Downloads"
-    path: "/Users/ngoctrammai/Downloads/"
+// ================= ROOTS (trang Home) =================
+// Không còn cố định trong code:
+//   - Windows: tự lấy các ổ đĩa đang có (Disk_C, Disk_D, ...)
+//   - macOS:   /Users
+//   - khác:    thư mục home của user
+// Ngoài ra là các thư mục người dùng bấm "Pick", lưu trong picked.json (cạnh server.js).
+const pickedFile = path.join(__dirname, "picked.json");
+
+const readPicked = () => {
+  try {
+    const list = JSON.parse(fs.readFileSync(pickedFile, "utf8"));
+    return Array.isArray(list) ? list.filter((p) => p && p.name && p.path) : [];
+  } catch (e) {
+    return [];
   }
+};
+const writePicked = (list) => fs.writeFileSync(pickedFile, JSON.stringify(list, null, 2));
+
+const getSystemRoots = () => {
+  if (process.platform === "win32") {
+    const drives = [];
+    for (let code = 65; code <= 90; code++) {
+      const letter = String.fromCharCode(code);
+      try {
+        // path dạng "E:" (như bản cũ) để ghép "E:" + "/" + ...
+        if (fs.existsSync(`${letter}:\\`)) drives.push({ name: `Disk_${letter}`, path: `${letter}:` });
+      } catch (e) {}
+    }
+    return drives;
+  }
+  if (process.platform === "darwin") return [{ name: "Users", path: "/Users" }];
+  return [{ name: "Home", path: os.homedir() }];
+};
+
+// Danh sách root hiện tại (tính lại mỗi lần gọi: cắm/rút ổ đĩa, pick/bỏ pick đều có hiệu lực ngay)
+const getRoots = () => [
+  ...getSystemRoots().map((r) => ({ ...r, picked: false })),
+  ...readPicked().map((r) => ({ ...r, picked: true }))
 ];
+const findRoot = (name) => getRoots().find((r) => r.name === name);
+const rootPathOf = (name) => {
+  const root = findRoot(name);
+  if (!root) throw new Error("Khong co root: " + name);
+  return root.path;
+};
+
+const samePath = (a, b) => {
+  const norm = (p) => {
+    const r = path.resolve(p + "/");
+    return process.platform === "win32" ? r.toLowerCase() : r;
+  };
+  return norm(a) === norm(b);
+};
+
+// segments = ["Disk_E", "Phim", "abc"] -> đường dẫn thật trên máy; null nếu root không tồn tại hoặc cố thoát ra ngoài root
+const resolveFolder = (segments) => {
+  const root = findRoot(_.first(segments));
+  if (!root) return null;
+  const rootAbs = path.resolve(root.path + "/");
+  const full = path.resolve(rootAbs, ..._.drop(segments));
+  const rel = path.relative(rootAbs, full);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return full;
+};
 
 let fileTypes = ["\\.mp4", "\\.mkv", "\\.webm", "\\.TS"];
 let pathToConverts = [];
@@ -57,37 +107,62 @@ app.get("/statis/*", (req, res) => {
   res.send(asd.join(""));
 });
 
-folderPuclic.forEach((f) => {
-  app.use(`/public/${f.name}`, express.static(path.join(f.path, "/")));
+// Phục vụ file video (hỗ trợ Range để tua). Thư mục thì chuyển tiếp xuống handler liệt kê bên dưới.
+const safeDecode = (p) => {
+  try {
+    return decodeURIComponent(p);
+  } catch (e) {
+    return p;
+  }
+};
+app.use("/public", (req, res, next) => {
+  const segments = req.path.split("/").filter((p) => !!p).map(safeDecode);
+  if (segments.length < 2) return next();
+  const file = resolveFolder(segments);
+  if (!file) return next();
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) return next();
+    res.sendFile(file, { dotfiles: "allow" }, (e) => {
+      if (e && !res.headersSent) next(e);
+    });
+  });
 });
+
 app.get("/public/*", function (req, res) {
   const fullPath = req.params[0].split("/").filter((p) => !!p);
 
-  let root = _.first(fullPath) || "";
   const list = [];
-  if (!root) {
-    folderPuclic.forEach((f) => {
-      list.push({ type: "folder", name: f.name });
+  if (_.isEmpty(fullPath)) {
+    // Trang Home: ổ đĩa / /Users + các thư mục đã pick
+    getRoots().forEach((r) => {
+      if (r.picked && !fs.existsSync(r.path)) return; // thư mục đã pick nhưng đang không truy cập được (vd rút ổ ngoài) thì ẩn tạm
+      list.push({ type: "folder", name: r.name, picked: r.picked });
     });
     res.send(list);
     return;
   }
 
-  const pathRoot = folderPuclic.find((f) => f.name === root).path;
-  const path = [pathRoot, ..._.drop(fullPath)].join("/");
+  const dir = resolveFolder(fullPath);
+  if (!dir) {
+    res.send([]);
+    return;
+  }
+  const pickedList = readPicked();
 
   try {
-    const folderNames = fs.readdirSync(path + "/");
+    const folderNames = fs.readdirSync(dir);
     const paths = [];
     folderNames.forEach((name) => {
+      const itemPath = path.join(dir, name);
       let itemStat;
       try {
-        itemStat = fs.statSync([path, name].join("/"));
+        itemStat = fs.statSync(itemPath);
       } catch (error) {}
 
       if (itemStat && itemStat.isDirectory()) {
-        list.push({ type: "folder", name });
-      } else if (fileTypes.find((type) => name.includes(type.replace('\\', '')))) {
+        const pickedItem = pickedList.find((p) => samePath(p.path, itemPath));
+        list.push({ type: "folder", name, picked: !!pickedItem, ...(pickedItem ? { pickedName: pickedItem.name } : {}) });
+      } else if (fileTypes.find((type) => name.includes(type.replace("\\", "")))) {
         list.push({ type: "file", name });
         paths.push([...fullPath, name].join("/"));
       }
@@ -97,10 +172,52 @@ app.get("/public/*", function (req, res) {
     res.send(list);
     return;
   } catch (error) {
-    console.log(error);
-    
+    console.log(error.message);
   }
-  res.send("listName");
+  res.send([]);
+});
+
+// Pick một thư mục -> hiện ở trang Home. POST /pick/<root>/<thư mục con>/...
+app.post("/pick/*", (req, res) => {
+  const segments = req.params[0].split("/").filter((p) => !!p);
+  if (segments.length < 2) return res.status(400).send({ error: "Chi pick duoc thu muc ben trong o dia" });
+  const dir = resolveFolder(segments);
+  let isDir = false;
+  try {
+    isDir = !!dir && fs.statSync(dir).isDirectory();
+  } catch (e) {}
+  if (!isDir) return res.status(404).send({ error: "Khong tim thay thu muc" });
+
+  try {
+    const list = readPicked();
+    const existed = list.find((p) => samePath(p.path, dir));
+    if (existed) return res.send({ ok: true, name: existed.name });
+
+    const used = getRoots().map((r) => r.name);
+    const base = path.basename(dir) || _.last(segments);
+    let name = base;
+    for (let i = 2; used.includes(name); i++) name = `${base} (${i})`;
+    list.push({ name, path: dir });
+    writePicked(list);
+    res.send({ ok: true, name });
+  } catch (error) {
+    console.log("pick error:", error.message);
+    res.status(500).send({ error: "Khong luu duoc" });
+  }
+});
+
+// Bỏ pick (chỉ xoá khỏi Home, không động tới thư mục thật). DELETE /pick/<tên trên Home>
+app.delete("/pick/*", (req, res) => {
+  const name = req.params[0].split("/").filter((p) => !!p)[0];
+  try {
+    const list = readPicked();
+    const next = list.filter((p) => p.name !== name);
+    if (next.length !== list.length) writePicked(next);
+    res.send({ ok: true });
+  } catch (error) {
+    console.log("unpick error:", error.message);
+    res.status(500).send({ error: "Khong luu duoc" });
+  }
 });
 
 app.get("/trasks/*", function (req, res) {
@@ -111,7 +228,7 @@ app.get("/trasks/*", function (req, res) {
     const fullPath = pathFile.split("/").filter((p) => !!p);
 
     let root = _.first(fullPath) || "";
-    const pathRoot = folderPuclic.find((f) => f.name === root).path;
+    const pathRoot = rootPathOf(root);
     const stream = new SubtitleStream();
     let isTracks = false;
 
@@ -163,7 +280,7 @@ const audioJobs = new Map(); // outPath -> { error: boolean }
 const resolveMediaFile = (p) => {
   const fullPath = (p || "").split("/").filter((x) => !!x);
   if (fullPath.length < 2 || fullPath.includes("..")) return null;
-  const folder = folderPuclic.find((f) => f.name === _.first(fullPath));
+  const folder = findRoot(_.first(fullPath));
   if (!folder) return null;
   return { fullPath, file: [folder.path, ..._.drop(fullPath)].join("/") };
 };
@@ -401,7 +518,7 @@ const isOutsideLang = (language) => language === "default_sv" || (typeof languag
 
 const listSubtitlesOutside = (fullPath) => {
   const root = _.first(fullPath) || "";
-  const pathRoot = folderPuclic.find((f) => f.name === root).path;
+  const pathRoot = rootPathOf(root);
   const folder = [pathRoot, ..._.drop(_.dropRight(fullPath))].join("/");
   const base = _.last(fullPath).replace(/\.[^.]+$/, "");
   const result = [];
@@ -471,7 +588,12 @@ const convert = (path, fulltracks) => {
 
     const fullPath = path.split("/").filter((p) => !!p);
     let root = _.first(fullPath) || "";
-    const pathRoot = folderPuclic.find((f) => f.name === root).path;
+    const rootInfo = findRoot(root);
+    if (!rootInfo) {
+      resolve(""); // root đã bị bỏ pick / ổ đĩa đã rút
+      return;
+    }
+    const pathRoot = rootInfo.path;
 
     let newTracks = _.cloneDeep(fulltracks);
     if (!newTracks) {
