@@ -1,1 +1,26 @@
-[]
+[
+  {
+    "action": "add",
+    "word": {
+      "id": "you have no idea",
+      "src": "You have no idea",
+      "meaning": "Bạn không thể tưởng tượng được đâu",
+      "detail": "",
+      "from": "en",
+      "to": "vi",
+      "savedAt": 1791704894515
+    }
+  },
+  {
+    "action": "add",
+    "word": {
+      "id": "peaceful",
+      "src": "peaceful",
+      "meaning": "hoà bình",
+      "detail": "Adjective: yên ổn",
+      "from": "en",
+      "to": "vi",
+      "savedAt": 1791705753495
+    }
+  }
+]
