@@ -14,6 +14,16 @@ const assLib = require("./ass");
 const mime = require("mime-types");
 const { spawn, execFile } = require("child_process");
 const os = require("os");
+const { pipeline } = require("stream");
+
+// ================= CHỐNG SẬP SERVICE =================
+// Lỗi không bắt được (stream ENOENT, promise không catch, ...) chỉ ghi log chứ không làm service chết.
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err && err.stack ? err.stack : err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason && reason.stack ? reason.stack : reason);
+});
 
 // ffmpeg / ffprobe: ưu tiên bản đóng gói sẵn trong npm (ffmpeg-static, ffprobe-static),
 // nếu chưa cài thì dùng ffmpeg/ffprobe có trong PATH của máy.
@@ -98,13 +108,19 @@ app.use(cors());
 app.use(express.static("public"));
 
 app.get("/statis/*", (req, res) => {
-  const name = req.params[0];
-  const content = fs.readFileSync(`./statis/${name}`, "utf-8");
-  const asd = content.split("\r\n\r\n").map((text) => {
-    const newText = _.drop(text.split(new RegExp("\r\n|      ")), 2);
-    return `<div>${newText.map((t) => t.trim()).join("<br>")}</div><div>12345678987654321</div>`;
-  });
-  res.send(asd.join(""));
+  try {
+    const name = req.params[0];
+    if (name.split(/[\\/]/).includes("..")) return res.status(400).send("");
+    const content = fs.readFileSync(`./statis/${name}`, "utf-8");
+    const asd = content.split("\r\n\r\n").map((text) => {
+      const newText = _.drop(text.split(new RegExp("\r\n|      ")), 2);
+      return `<div>${newText.map((t) => t.trim()).join("<br>")}</div><div>12345678987654321</div>`;
+    });
+    res.send(asd.join(""));
+  } catch (error) {
+    console.log("statis error:", error.message);
+    res.status(404).send("");
+  }
 });
 
 // Phục vụ file video (hỗ trợ Range để tua). Thư mục thì chuyển tiếp xuống handler liệt kê bên dưới.
@@ -167,8 +183,8 @@ app.get("/public/*", function (req, res) {
         paths.push([...fullPath, name].join("/"));
       }
     });
-    cleanSubs(folderNames, fullPath);
-    convertSubtitle(paths);
+    cleanSubs(folderNames, fullPath).catch(() => {});
+    convertSubtitle(paths).catch((e) => console.log("convertSubtitle error:", e.message));
     res.send(list);
     return;
   } catch (error) {
@@ -222,6 +238,28 @@ app.delete("/pick/*", (req, res) => {
 
 app.get("/trasks/*", function (req, res) {
   let fulltracks = [];
+  let sent = false;
+  // Chỉ trả lời 1 lần (tránh "Cannot set headers after they are sent" làm sập service)
+  const send = (data) => {
+    if (sent || res.headersSent) return;
+    sent = true;
+    try {
+      res.send(data);
+    } catch (e) {
+      console.log("trasks send error:", e.message);
+    }
+  };
+  let readStream = null;
+  // Đã có danh sách track thì thôi đọc tiếp file video lớn, đồng thời nhả file descriptor
+  const cleanup = () => {
+    try {
+      if (readStream) {
+        readStream.unpipe();
+        readStream.destroy();
+      }
+    } catch (e) {}
+  };
+  res.on("close", cleanup);
 
   try {
     let pathFile = req.params[0];
@@ -237,38 +275,56 @@ app.get("/trasks/*", function (req, res) {
     });
     stream.once("tracks", (tracks) => {
       isTracks = true;
-      for (let index = 0; index < tracks.length; index++) {
-        const { language, name } = tracks[index];
-        if (!fulltracks.find((t) => t.language == language + "_sv"))
-          fulltracks.push({
-            language: language ? language + "_sv" : language,
-            lable: name || language,
-            type: "utf8",
-            default: index == 0 && _.isEmpty(fulltracks),
-            number: tracks[index].number
-          });
-      }
       try {
-        let fileSubtile = _.clone(pathFile).replace(new RegExp(fileTypes.join("|"), "g"), ".json");
-        fs.readFileSync(`subtitles/${fileSubtile}`, "utf8");
-        res.send(fulltracks.filter((t) => !!t.language));
+        for (let index = 0; index < tracks.length; index++) {
+          const { language, name } = tracks[index];
+          if (!fulltracks.find((t) => t.language == language + "_sv"))
+            fulltracks.push({
+              language: language ? language + "_sv" : language,
+              lable: name || language,
+              type: "utf8",
+              default: index == 0 && _.isEmpty(fulltracks),
+              number: tracks[index].number
+            });
+        }
+        try {
+          let fileSubtile = _.clone(pathFile).replace(new RegExp(fileTypes.join("|"), "g"), ".json");
+          fs.readFileSync(`subtitles/${fileSubtile}`, "utf8");
+          send(fulltracks.filter((t) => !!t.language));
+        } catch (error) {
+          convertSubtitle([pathFile], fulltracks).catch((e) => console.log("convertSubtitle error:", e.message));
+          send({ waiting: true });
+        }
       } catch (error) {
-        convertSubtitle([pathFile], fulltracks);
-        res.send({ waiting: true });
+        console.log("trasks tracks error:", error.message);
+        send(fulltracks.filter((t) => !!t.language));
       }
+      cleanup();
     });
-    stream.once("drain", (drain) => {
+    const onNoTracks = () => {
       if (!isTracks) {
-        res.send(fulltracks);
+        send(fulltracks);
+        cleanup();
       }
+    };
+    stream.once("drain", onNoTracks);
+    stream.once("finish", onNoTracks); // file nhỏ / không phải mkv: đọc hết mà không có 'drain'
+    // on (không phải once): lỗi giải mã có thể phát nhiều lần, lần thứ 2 mà không có handler sẽ làm sập service
+    stream.on("error", (error) => {
+      console.log("trasks stream error:", error.message);
+      send(fulltracks);
+      cleanup();
     });
-    stream.once("error", (error) => {
-      res.send(fulltracks);
+    readStream = fs.createReadStream([pathRoot, ..._.drop(fullPath)].join("/"));
+    readStream.on("error", (error) => {
+      // File video không tồn tại / không đọc được (ENOENT, EACCES...): vẫn trả các sub nằm ngoài
+      console.log("trasks read error:", error.message);
+      send(fulltracks);
     });
-    fs.createReadStream([pathRoot, ..._.drop(fullPath)].join("/")).pipe(stream);
+    readStream.pipe(stream);
   } catch (error) {
-    console.log(" error", error);
-    res.send(fulltracks);
+    console.log(" error", error.message);
+    send(fulltracks);
   }
 });
 
@@ -413,74 +469,108 @@ app.get("/audio-file/*", (req, res) => {
   const out = audioCachePath(m.fullPath, track);
   if (!fs.existsSync(out)) return res.sendStatus(404);
   res.type("audio/mp4");
-  res.sendFile(out, { dotfiles: "allow" });
+  res.sendFile(out, { dotfiles: "allow" }, (e) => {
+    if (e && !res.headersSent) res.sendStatus(e.status || 500);
+  });
 });
 
 app.get("/read/*", function (req, res) {
-  const fullPath = req.params[0].split("/").filter((p) => !!p);
-  const path = getSubtitlesOutside(fullPath);
-  let data = fs.readFileSync(path, "utf8");
-  const datas = data.split("\r\n");
-  return res.send(datas);
+  try {
+    const fullPath = req.params[0].split("/").filter((p) => !!p);
+    const subPath = getSubtitlesOutside(fullPath);
+    if (!subPath) return res.send([]);
+    return res.send(fs.readFileSync(subPath, "utf8").split("\r\n"));
+  } catch (error) {
+    console.log("read error:", error.message);
+    res.send([]);
+  }
 });
 
 const sendVtt = (res, vtt) => {
   res.set("Content-Type", "text/vtt; charset=utf-8");
   res.send(vtt);
 };
+const EMPTY_VTT = "WEBVTT FILE\r\n\r\n";
+
+// Đẩy dữ liệu qua srt2vtt rồi trả cho client. pipeline bắt mọi lỗi stream (kể cả lỗi giữa chừng) và tự dọn các stream.
+const pipeVtt = (res, source) => {
+  res.set("Content-Type", "text/vtt; charset=utf-8");
+  pipeline(source, srt2vtt(), res, (err) => {
+    if (err) console.log("vtt stream error:", err.code || err.message);
+  });
+};
+
+// Như trên nhưng đọc từ file: nếu không mở được file (mất file, không có quyền) thì trả VTT rỗng thay vì làm sập service
+const pipeFileVtt = (res, filePath) => {
+  const rs = fs.createReadStream(filePath);
+  const onOpenError = (err) => {
+    console.log("read sub error:", err.message);
+    if (!res.headersSent) sendVtt(res, EMPTY_VTT);
+    else res.destroy();
+  };
+  rs.once("error", onOpenError);
+  rs.once("open", () => {
+    rs.removeListener("error", onOpenError);
+    pipeVtt(res, rs);
+  });
+};
 
 app.get("/subtitles/*", function (req, res) {
-  const fullPath = req.params[0].split("/").filter((p) => !!p);
-  let pathFile = req.params[0].replace(new RegExp(fileTypes.join("|"), "g"), ".json");
-  const language = req.query.language;
-  let str = "";
-  if (isOutsideLang(language)) {
-    const path = getSubtitlesOutside(fullPath, language);
-    if (path) {
-      if (/\.ass$/i.test(path)) {
+  try {
+    const fullPath = req.params[0].split("/").filter((p) => !!p);
+    let pathFile = req.params[0].replace(new RegExp(fileTypes.join("|"), "g"), ".json");
+    const language = req.query.language;
+    let str = "";
+    if (isOutsideLang(language)) {
+      const subPath = getSubtitlesOutside(fullPath, language);
+      if (!subPath) return res.end();
+      if (/\.ass$/i.test(subPath)) {
         // Đọc ASS trực tiếp (giữ \pos, \an, \fs, màu... và style) thay vì ass-to-srt
         try {
-          const parsed = assLib.parseAss(assLib.decodeText(fs.readFileSync(path)));
+          const parsed = assLib.parseAss(assLib.decodeText(fs.readFileSync(subPath)));
           sendVtt(res, assLib.eventsToVtt(parsed.events));
           return;
         } catch (error) {
-          console.log("ass parse error", error);
+          console.log("ass parse error", error.message);
         }
-        const str = fs.readFileSync(path);
-        strstream(ass2srt(str)).pipe(srt2vtt()).pipe(res);
+        pipeVtt(res, strstream(ass2srt(fs.readFileSync(subPath))));
       } else {
-        fs.createReadStream(path).pipe(srt2vtt()).pipe(res);
+        pipeFileVtt(res, subPath);
       }
-    } else strstream("").pipe(res);
-    return;
-  }
-  try {
-    const data = fs.readFileSync(`subtitles/${pathFile}`, "utf8");
-    if (data) {
-      const info = JSON.parse(data || "{}");
-      const cues = info[language] || [];
-      const isAss = (info._ass && info._ass[language]) || cues.some((c) => assLib.looksLikeAss(c.data && c.data.text));
-      if (isAss) {
-        // Track ASS (hoặc text có thẻ ASS): giữ nguyên thẻ + thông tin style cho client tự vẽ
-        const events = cues.map((c) => ({
-          start: c.data.start / 1000,
-          end: c.data.end / 1000,
-          text: c.data.text,
-          style: c.data.style,
-          layer: c.data.layer,
-          marginL: c.data.marginL,
-          marginR: c.data.marginR,
-          marginV: c.data.marginV
-        }));
-        sendVtt(res, assLib.eventsToVtt(events));
-        return;
-      }
-      str = stringifySync(cues, { format: "SRT" });
-      strstream(str).pipe(srt2vtt()).pipe(res);
       return;
     }
-  } catch (error) {}
-  strstream("").pipe(srt2vtt()).pipe(res);
+    try {
+      const data = fs.readFileSync(`subtitles/${pathFile}`, "utf8");
+      if (data) {
+        const info = JSON.parse(data || "{}");
+        const cues = info[language] || [];
+        const isAss = (info._ass && info._ass[language]) || cues.some((c) => assLib.looksLikeAss(c.data && c.data.text));
+        if (isAss) {
+          // Track ASS (hoặc text có thẻ ASS): giữ nguyên thẻ + thông tin style cho client tự vẽ
+          const events = cues.map((c) => ({
+            start: c.data.start / 1000,
+            end: c.data.end / 1000,
+            text: c.data.text,
+            style: c.data.style,
+            layer: c.data.layer,
+            marginL: c.data.marginL,
+            marginR: c.data.marginR,
+            marginV: c.data.marginV
+          }));
+          sendVtt(res, assLib.eventsToVtt(events));
+          return;
+        }
+        str = stringifySync(cues, { format: "SRT" });
+        pipeVtt(res, strstream(str));
+        return;
+      }
+    } catch (error) {}
+    pipeVtt(res, strstream(""));
+  } catch (error) {
+    console.log("subtitles error:", error.message);
+    if (!res.headersSent) sendVtt(res, EMPTY_VTT);
+    else res.destroy();
+  }
 });
 
 // Header của sub ASS: PlayResX/PlayResY + bảng style (client dùng để vẽ đúng cỡ chữ, màu, vị trí)
@@ -505,10 +595,22 @@ app.get("/subtitles-style/*", function (req, res) {
 
 require("./translate")(app); // /translate, /tts (dịch + giọng đọc)
 
+// Lỗi trong route (kể cả lỗi đồng bộ) -> trả 500 thay vì làm sập; phải đặt sau tất cả route
+app.use((err, req, res, next) => {
+  console.log("express error:", req.method, req.originalUrl, "-", err && err.message);
+  if (res.headersSent) return res.destroy();
+  res.status(err && (err.status || err.statusCode) ? err.status || err.statusCode : 500).send({ error: "Loi server" });
+});
+
 const server = app.listen(8081, function () {
   const host = server.address().address;
   const port = server.address().port;
   console.log("Ung dung Node.js dang lang nghe tai dia chi: http://%s:%s", host, port);
+});
+server.on("error", (err) => {
+  console.error("Server error:", err.message);
+  // Không mở được cổng (đang bị chiếm / không có quyền) thì thoát hẳn để dễ nhận ra, tránh chạy "ma" không nhận kết nối
+  if (err.code === "EADDRINUSE" || err.code === "EACCES") process.exit(1);
 });
 
 // Sub nằm ngoài, cùng thư mục với video. Với video "video.mp4" nhận:
@@ -559,7 +661,11 @@ const cleanSubs = async (fileNames, fullPath) => {
   } catch (error) {}
 };
 
-const convertSubtitle = async (paths, tracks, continue_) => {
+const convertFailedAt = new Map(); // đường dẫn video -> thời điểm lỗi gần nhất, tránh thử lại liên tục mỗi lần mở thư mục
+const CONVERT_RETRY_MS = 5 * 60 * 1000;
+
+// Hàng đợi tách sub: chạy tuần tự; 1 file lỗi không được làm kẹt hay làm sập cả hàng đợi
+const convertSubtitle = async (paths, tracks) => {
   if (paths) {
     paths.forEach((path) => {
       if (!pathToConverts.find((c) => c.path === path)) {
@@ -567,121 +673,196 @@ const convertSubtitle = async (paths, tracks, continue_) => {
       }
     });
   }
-  if ((!converting || continue_) && !_.isEmpty(pathToConverts)) {
-    converting = true;
-    await convert(pathToConverts[0].path, pathToConverts[0].tracks);
-    pathToConverts = _.drop(pathToConverts);
-    if (_.isEmpty(pathToConverts)) {
-      converting = false;
-    } else {
-      convertSubtitle(null, null, true);
+  if (converting) return;
+  converting = true;
+  try {
+    while (!_.isEmpty(pathToConverts)) {
+      const job = pathToConverts[0];
+      try {
+        await convert(job.path, job.tracks);
+      } catch (error) {
+        console.log("convert error:", job.path, "-", error.message);
+      }
+      pathToConverts = _.drop(pathToConverts);
     }
+  } finally {
+    converting = false;
   }
 };
 
+// Promise luôn resolve (không bao giờ reject hay treo) để hàng đợi không bị kẹt
 const convert = (path, fulltracks) => {
-  return new Promise((resolve, reject) => {
-    let pathFile = _.clone(path).replace(new RegExp(fileTypes.join("|"), "g"), ".json");
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const fail = (message) => {
+      console.log("convert error:", path, "-", message);
+      convertFailedAt.set(path, Date.now());
+      done("");
+    };
+
     try {
-      fs.readFileSync(`subtitles/${pathFile}`, "utf8");
-      resolve("");
-      return;
-    } catch (error) {}
-
-    const fullPath = path.split("/").filter((p) => !!p);
-    let root = _.first(fullPath) || "";
-    const rootInfo = findRoot(root);
-    if (!rootInfo) {
-      resolve(""); // root đã bị bỏ pick / ổ đĩa đã rút
-      return;
-    }
-    const pathRoot = rootInfo.path;
-
-    let newTracks = _.cloneDeep(fulltracks);
-    if (!newTracks) {
+      let pathFile = _.clone(path).replace(new RegExp(fileTypes.join("|"), "g"), ".json");
       try {
-        newTracks = [];
-        const stream = new SubtitleStream();
-        let isTracks = false;
-        stream.once("tracks", (tracks) => {
-          isTracks = true;
-          for (let index = 0; index < tracks.length; index++) {
-            const { language, lable } = tracks[index];
-            if (!newTracks.find((t) => t.language == language + "_sv"))
-              newTracks.push({
-                language: language ? language + "_sv" : language,
-                lable: lable || language,
-                type: "utf8",
-                default: index == 0,
-                number: tracks[index].number
-              });
-          }
-          parter(newTracks, path, pathFile, pathRoot, fullPath, resolve, reject);
-        });
-        stream.once("drain", (drain) => {
-          if (!isTracks) {
-            fsExtra.outputFile(`subtitles/${pathFile}`, JSON.stringify({}));
-            resolve("");
-          }
-        });
-        fs.createReadStream([pathRoot, ..._.drop(fullPath)].join("/")).pipe(stream);
-      } catch (error) {
-        fsExtra.outputFile(`subtitles/${pathFile}`, JSON.stringify({}));
-        resolve("");
+        fs.readFileSync(`subtitles/${pathFile}`, "utf8");
+        done("");
+        return;
+      } catch (error) {}
+
+      const failedAt = convertFailedAt.get(path);
+      if (failedAt && Date.now() - failedAt < CONVERT_RETRY_MS) {
+        done(""); // vừa lỗi gần đây, chưa thử lại ngay
         return;
       }
-    } else {
-      parter(newTracks, path, pathFile, pathRoot, fullPath, resolve, reject);
+
+      const fullPath = path.split("/").filter((p) => !!p);
+      let root = _.first(fullPath) || "";
+      const rootInfo = findRoot(root);
+      if (!rootInfo) {
+        done(""); // root đã bị bỏ pick / ổ đĩa đã rút
+        return;
+      }
+      const pathRoot = rootInfo.path;
+
+      let newTracks = _.cloneDeep(fulltracks);
+      if (!newTracks) {
+        newTracks = [];
+        let isTracks = false;
+        const stream = new SubtitleStream();
+        const rs = fs.createReadStream([pathRoot, ..._.drop(fullPath)].join("/"));
+        // Đọc xong danh sách track thì ngừng đọc file này (parter sẽ mở luồng đọc riêng), nhả file descriptor
+        const stop = () => {
+          try {
+            rs.unpipe(stream);
+            rs.destroy();
+          } catch (e) {}
+        };
+        stream.on("error", (error) => {
+          stop();
+          fail(error.message);
+        });
+        rs.on("error", (error) => fail(error.message)); // file không tồn tại / không đọc được
+        stream.once("tracks", (tracks) => {
+          isTracks = true;
+          stop();
+          try {
+            for (let index = 0; index < tracks.length; index++) {
+              const { language, lable } = tracks[index];
+              if (!newTracks.find((t) => t.language == language + "_sv"))
+                newTracks.push({
+                  language: language ? language + "_sv" : language,
+                  lable: lable || language,
+                  type: "utf8",
+                  default: index == 0,
+                  number: tracks[index].number
+                });
+            }
+            parter(newTracks, path, pathFile, pathRoot, fullPath, done, fail);
+          } catch (error) {
+            fail(error.message);
+          }
+        });
+        const onNoTracks = () => {
+          if (!isTracks && !settled) {
+            stop();
+            // File không có sub (hoặc không đọc được như mkv): ghi json rỗng để không phải quét lại
+            fsExtra
+              .outputFile(`subtitles/${pathFile}`, JSON.stringify({}))
+              .catch((e) => console.log("write empty sub json error:", e.message))
+              .then(() => done(""));
+          }
+        };
+        stream.once("drain", onNoTracks);
+        stream.once("finish", onNoTracks); // file nhỏ: đọc hết mà không có 'drain' thì hàng đợi bị kẹt mãi
+        rs.pipe(stream);
+      } else {
+        parter(newTracks, path, pathFile, pathRoot, fullPath, done, fail);
+      }
+    } catch (error) {
+      fail(error.message);
     }
   });
 };
-const parter = (newTracks, path, pathFile, pathRoot, fullPath, resolve, reject) => {
+
+const parter = (newTracks, path, pathFile, pathRoot, fullPath, resolve, fail) => {
   const parser = new SubtitleParser();
   const subtitleObj = {};
   const assMeta = {}; // language -> { playResX, playResY, styles } cho track ASS
   let index = 1;
   parser.once("tracks", (tracks) => {
-    (tracks || []).forEach((t) => {
-      const lang = (newTracks.find((n) => n.number == t.number) || {}).language;
-      if (lang && t.header && /\[(V4\+? Styles|Script Info)\]/i.test(String(t.header))) {
-        assMeta[lang] = assLib.parseAssHeader(t.header);
-      }
-    });
+    try {
+      (tracks || []).forEach((t) => {
+        const lang = (newTracks.find((n) => n.number == t.number) || {}).language;
+        if (lang && t.header && /\[(V4\+? Styles|Script Info)\]/i.test(String(t.header))) {
+          assMeta[lang] = assLib.parseAssHeader(t.header);
+        }
+      });
+    } catch (error) {
+      console.log("ass header error:", path, "-", error.message); // header ASS lạ: bỏ qua thông tin style, vẫn lấy được chữ
+    }
   });
   parser.on("subtitle", (subtitle, trackNumber) => {
-    if (index % 200 === 0) {
-      console.log(pathFile, ": ", index);
-    }
-    index++;
-    const { language } = newTracks.find((track) => track.number == trackNumber) || {};
-    if (language && subtitle.duration < 10000) {
-      const rowRob = {
-        type: "cue",
-        data: { start: subtitle.time, end: subtitle.time + subtitle.duration, text: subtitle.text }
-      };
-      if (subtitle.style !== undefined) {
-        // Track ASS: lưu thêm style / layer / margin riêng của từng dòng
-        Object.assign(rowRob.data, {
-          style: subtitle.style,
-          layer: subtitle.layer,
-          marginL: subtitle.marginL,
-          marginR: subtitle.marginR,
-          marginV: subtitle.marginV
-        });
-        if (!assMeta[language]) assMeta[language] = { playResX: 0, playResY: 0, styles: {} };
+    try {
+      if (index % 200 === 0) {
+        console.log(pathFile, ": ", index);
       }
-      if (subtitleObj[language]) {
-        subtitleObj[language].push(rowRob);
-      } else {
-        subtitleObj[language] = [rowRob];
+      index++;
+      const { language } = newTracks.find((track) => track.number == trackNumber) || {};
+      if (language && subtitle.duration < 10000) {
+        const rowRob = {
+          type: "cue",
+          data: { start: subtitle.time, end: subtitle.time + subtitle.duration, text: subtitle.text }
+        };
+        if (subtitle.style !== undefined) {
+          // Track ASS: lưu thêm style / layer / margin riêng của từng dòng
+          Object.assign(rowRob.data, {
+            style: subtitle.style,
+            layer: subtitle.layer,
+            marginL: subtitle.marginL,
+            marginR: subtitle.marginR,
+            marginV: subtitle.marginV
+          });
+          if (!assMeta[language]) assMeta[language] = { playResX: 0, playResY: 0, styles: {} };
+        }
+        if (subtitleObj[language]) {
+          subtitleObj[language].push(rowRob);
+        } else {
+          subtitleObj[language] = [rowRob];
+        }
       }
+    } catch (error) {
+      console.log("subtitle row error:", path, "-", error.message); // 1 dòng sub lỗi thì bỏ dòng đó
     }
+  });
+  const rs = fs.createReadStream([pathRoot, ..._.drop(fullPath)].join("/"));
+  parser.on("error", (error) => {
+    try {
+      rs.unpipe(parser);
+      rs.destroy();
+    } catch (e) {}
+    fail(error.message);
+  });
+  rs.on("error", (error) => {
+    // Mất file giữa chừng: bỏ dở, không ghi file json thiếu dữ liệu (lần sau sẽ tách lại)
+    try {
+      rs.unpipe(parser);
+      parser.destroy();
+    } catch (e) {}
+    fail(error.message);
   });
   parser.on("finish", () => {
     if (!_.isEmpty(assMeta)) subtitleObj._ass = assMeta;
-    fsExtra.outputFile(`subtitles/${pathFile}`, JSON.stringify(subtitleObj));
-    console.log(path, ": finish");
-    resolve("finish");
+    fsExtra
+      .outputFile(`subtitles/${pathFile}`, JSON.stringify(subtitleObj))
+      .then(() => {
+        console.log(path, ": finish");
+        resolve("finish");
+      })
+      .catch((error) => fail("Khong ghi duoc file sub: " + error.message));
   });
-  fs.createReadStream([pathRoot, ..._.drop(fullPath)].join("/")).pipe(parser);
+  rs.pipe(parser);
 };

@@ -45,6 +45,7 @@ const httpFetch = (urlStr, opts = {}, redirects = 5) =>
           return resolve(httpFetch(next, keep ? opts : { method: "GET", timeout }, redirects - 1));
         }
         const chunks = [];
+        res.on("error", reject); // đứt kết nối giữa chừng khi đang nhận dữ liệu
         res.on("data", (c) => chunks.push(c));
         res.on("end", () => resolve({ status: code, ok: code >= 200 && code < 300, text: Buffer.concat(chunks).toString("utf8") }));
       }
@@ -483,6 +484,8 @@ module.exports = (app) => {
       }
       res.set("Content-Type", "audio/mpeg");
       res.set("Cache-Control", "public, max-age=86400");
+      up.on("error", () => res.end()); // Google ngắt giữa chừng
+      res.on("close", () => up.destroy()); // người dùng ngắt thì thôi tải tiếp
       up.pipe(res);
     });
     proxy.setTimeout(15000, () => proxy.destroy());
