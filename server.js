@@ -402,7 +402,7 @@ const probeAudio = (file) =>
 const audioCachePath = (fullPath, track) => path.join(audioDir, ..._.dropRight(fullPath), `${_.last(fullPath)}.a${track}.m4a`);
 
 // Tách 1 audio track ra file .m4a riêng (có cache) để trình duyệt phát song song với video
-const startAudioExtract = async (file, track, out) => {
+const startAudioExtract = async (file, track, out, mux = false) => {
   const job = { error: false };
   audioJobs.set(out, job);
   const tmp = out + ".part";
@@ -412,7 +412,8 @@ const startAudioExtract = async (file, track, out) => {
     if (!info) throw new Error("Khong co audio track " + track);
     fsExtra.ensureDirSync(path.dirname(out));
     const codecArgs = info.codec === "aac" ? ["-c:a", "copy"] : ["-c:a", "aac", "-b:a", info.channels > 2 ? "384k" : "192k"];
-    const args = ["-y", "-v", "error", "-i", file, "-map", `0:a:${track}`, "-vn", "-sn", "-dn", ...codecArgs, "-movflags", "+faststart", "-f", "mp4", tmp];
+    const maps = mux ? ["-map", "0:v:0", "-map", `0:a:${track}`, "-c:v", "copy"] : ["-map", `0:a:${track}`, "-vn"];
+    const args = ["-y", "-v", "error", "-i", file, ...maps, "-sn", "-dn", ...codecArgs, "-movflags", "+faststart", "-f", "mp4", tmp];
     console.log("audio extract:", file, "track", track, info.codec);
     await new Promise((resolve, reject) => {
       const proc = spawn(ffmpegPath, args);
@@ -431,6 +432,25 @@ const startAudioExtract = async (file, track, out) => {
     } catch (e) {}
     job.error = true; // báo lỗi 1 lần ở lần hỏi tiếp theo
   }
+};
+
+// Hàng đợi tách audio: chạy TUẦN TỰ (1 ffmpeg tại một thời điểm) để không làm nghẽn CPU/IO
+const jobQueue = [];
+let jobRunning = false;
+const runJobQueue = async () => {
+  if (jobRunning) return;
+  jobRunning = true;
+  while (jobQueue.length) {
+    const { out, run } = jobQueue.shift();
+    await run();
+  }
+  jobRunning = false;
+};
+const enqueueJob = (out, run) => {
+  if (audioJobs.has(out)) return;
+  audioJobs.set(out, { error: false, queued: true });
+  jobQueue.push({ out, run });
+  runJobQueue();
 };
 
 // Danh sách audio của file
@@ -457,7 +477,7 @@ app.get("/audio-prepare/*", (req, res) => {
     audioJobs.delete(out);
     return res.send({ error: true });
   }
-  if (!job) startAudioExtract(m.file, track, out);
+  if (!job) enqueueJob(out, () => startAudioExtract(m.file, track, out));
   res.send({ waiting: true });
 });
 
@@ -469,6 +489,38 @@ app.get("/audio-file/*", (req, res) => {
   const out = audioCachePath(m.fullPath, track);
   if (!fs.existsSync(out)) return res.sendStatus(404);
   res.type("audio/mp4");
+  res.sendFile(out, { dotfiles: "allow" }, (e) => {
+    if (e && !res.headersSent) res.sendStatus(e.status || 500);
+  });
+});
+
+// ================= VIDEO + AUDIO ĐÃ CHỌN (1 file mp4, không cần thẻ audio riêng) =================
+const mediaCachePath = (fullPath, track) => path.join(audioDir, ..._.dropRight(fullPath), `${_.last(fullPath)}.v${track}.mp4`);
+
+// Chuẩn bị file mux: { ready: true } | { waiting: true } | { error: true }
+app.get("/media-prepare/*", (req, res) => {
+  const track = parseInt(req.query.track, 10);
+  const m = resolveMediaFile(req.params[0]);
+  if (!m || isNaN(track) || track < 0 || !fs.existsSync(m.file)) return res.status(400).send({ error: true });
+  const out = mediaCachePath(m.fullPath, track);
+  if (fs.existsSync(out)) return res.send({ ready: true });
+  const job = audioJobs.get(out);
+  if (job && job.error) {
+    audioJobs.delete(out);
+    return res.send({ error: true });
+  }
+  if (!job) enqueueJob(out, () => startAudioExtract(m.file, track, out, true));
+  res.send({ waiting: true });
+});
+
+// File video đã remux (hỗ trợ Range để tua)
+app.get("/media-file/*", (req, res) => {
+  const track = parseInt(req.query.track, 10);
+  const m = resolveMediaFile(req.params[0]);
+  if (!m || isNaN(track) || track < 0) return res.sendStatus(400);
+  const out = mediaCachePath(m.fullPath, track);
+  if (!fs.existsSync(out)) return res.sendStatus(404);
+  res.type("video/mp4");
   res.sendFile(out, { dotfiles: "allow" }, (e) => {
     if (e && !res.headersSent) res.sendStatus(e.status || 500);
   });

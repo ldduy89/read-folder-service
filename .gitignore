@@ -11,6 +11,9 @@
 # subtitles
 /subtitles
 
+# audios
+/audios
+
 # production
 /build
 
