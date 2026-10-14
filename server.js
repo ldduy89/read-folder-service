@@ -184,6 +184,7 @@ app.get("/public/*", function (req, res) {
       }
     });
     cleanSubs(folderNames, fullPath).catch(() => {});
+    cleanMediaCache(folderNames, fullPath, dir);
     convertSubtitle(paths).catch((e) => console.log("convertSubtitle error:", e.message));
     res.send(list);
     return;
@@ -402,6 +403,13 @@ const probeAudio = (file) =>
 const audioCachePath = (fullPath, track) => path.join(audioDir, ..._.dropRight(fullPath), `${_.last(fullPath)}.a${track}.m4a`);
 
 // Tách 1 audio track ra file .m4a riêng (có cache) để trình duyệt phát song song với video
+const probeDuration = (file) =>
+  new Promise((resolve) => {
+    execFile(ffprobePath, ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file], (err, stdout) =>
+      resolve(err ? 0 : parseFloat(stdout) || 0)
+    );
+  });
+
 const startAudioExtract = async (file, track, out, mux = false) => {
   const job = { error: false };
   audioJobs.set(out, job);
@@ -413,7 +421,9 @@ const startAudioExtract = async (file, track, out, mux = false) => {
     fsExtra.ensureDirSync(path.dirname(out));
     const codecArgs = info.codec === "aac" ? ["-c:a", "copy"] : ["-c:a", "aac", "-b:a", info.channels > 2 ? "384k" : "192k"];
     const maps = mux ? ["-map", "0:v:0", "-map", `0:a:${track}`, "-c:v", "copy"] : ["-map", `0:a:${track}`, "-vn"];
-    const args = ["-y", "-v", "error", "-i", file, ...maps, "-sn", "-dn", ...codecArgs, "-movflags", "+faststart", "-f", "mp4", tmp];
+    // mux: tạo lại timestamp để tránh file bị cụt (player dừng sớm)
+    const fixArgs = mux ? ["-fflags", "+genpts"] : [];
+    const args = ["-y", "-v", "error", ...fixArgs, "-i", file, ...maps, "-sn", "-dn", ...codecArgs, "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", "-f", "mp4", tmp];
     console.log("audio extract:", file, "track", track, info.codec);
     await new Promise((resolve, reject) => {
       const proc = spawn(ffmpegPath, args);
@@ -422,6 +432,12 @@ const startAudioExtract = async (file, track, out, mux = false) => {
       proc.on("error", reject);
       proc.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err || `ffmpeg exit ${code}`))));
     });
+    if (mux) {
+      // kiểm tra file remux có đủ độ dài so với file gốc, nếu cụt thì báo lỗi thay vì dùng
+      const [srcDur, outDur] = [await probeDuration(file), await probeDuration(tmp)];
+      console.log("remux duration:", file, "src", srcDur, "out", outDur);
+      if (srcDur > 0 && outDur < srcDur * 0.95) throw new Error(`remux cut: ${outDur}s / ${srcDur}s`);
+    }
     fsExtra.moveSync(tmp, out, { overwrite: true });
     audioJobs.delete(out);
     console.log("audio extract: finish", out);
@@ -709,6 +725,27 @@ const cleanSubs = async (fileNames, fullPath) => {
       try {
         if (checkNoFile) fsExtra.removeSync(`subtitles/${[...fullPath, sub].join("/")}`);
       } catch (error) {}
+    });
+  } catch (error) {}
+};
+
+// Xoá cache audio/video đã remux của file không còn tồn tại, hoặc file gốc đã bị thay đổi sau khi tạo cache
+const CACHE_FILE = /^(.+)\.(v\d+\.mp4|a\d+\.m4a)(\.part)?$/;
+const cleanMediaCache = (folderNames, fullPath, dir) => {
+  try {
+    const cacheDir = path.join(audioDir, ...fullPath);
+    fs.readdirSync(cacheDir).forEach((cacheName) => {
+      const m = cacheName.match(CACHE_FILE);
+      if (!m) return;
+      const cachePath = path.join(cacheDir, cacheName);
+      const srcName = m[1];
+      // file gốc không còn trong thư mục -> xoá cache
+      if (!folderNames.includes(srcName)) return fsExtra.removeSync(cachePath);
+      // file gốc được ghi đè/thay đổi sau khi tạo cache -> cache cũ không còn đúng
+      if (!m[3]) {
+        const srcMtime = fs.statSync(path.join(dir, srcName)).mtimeMs;
+        if (fs.statSync(cachePath).mtimeMs < srcMtime) fsExtra.removeSync(cachePath);
+      }
     });
   } catch (error) {}
 };
